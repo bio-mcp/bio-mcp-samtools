@@ -9,6 +9,8 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ErrorContent
 from pydantic_settings import BaseSettings
 
+from .tool_detection import ToolDetector, ToolConfig, ExecutionMode, ToolInfo
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,6 +20,12 @@ class ServerSettings(BaseSettings):
     timeout: int = 1800  # 30 minutes for large files
     samtools_path: str = "samtools"
     
+    # Tool execution mode settings
+    execution_mode: Optional[str] = None
+    preferred_modes: str = "native,module,lmod,singularity,docker"
+    module_names: str = "samtools,SAMtools"
+    container_image: str = "biocontainers/samtools:1.19.2"
+    
     class Config:
         env_prefix = "BIO_MCP_"
 
@@ -26,7 +34,44 @@ class SamtoolsServer:
     def __init__(self, settings: Optional[ServerSettings] = None):
         self.settings = settings or ServerSettings()
         self.server = Server("bio-mcp-samtools")
+        self.detector = ToolDetector(logger)
+        self.tool_config = ToolConfig.from_env()
+        self.samtools_info = None
         self._setup_handlers()
+        
+    async def _detect_samtools(self) -> ToolInfo:
+        """Detect the best available execution mode for samtools."""
+        if self.samtools_info is not None:
+            return self.samtools_info
+        
+        # Parse settings
+        force_mode = None
+        if self.settings.execution_mode:
+            try:
+                force_mode = ExecutionMode(self.settings.execution_mode.lower())
+            except ValueError:
+                logger.warning(f"Invalid execution mode: {self.settings.execution_mode}")
+        
+        preferred_modes = []
+        for mode_str in self.settings.preferred_modes.split(","):
+            try:
+                mode = ExecutionMode(mode_str.strip().lower())
+                preferred_modes.append(mode)
+            except ValueError:
+                logger.warning(f"Invalid preferred mode: {mode_str}")
+        
+        module_names = [name.strip() for name in self.settings.module_names.split(",")]
+        
+        # Detect tool
+        self.samtools_info = self.detector.detect_tool(
+            tool_name="samtools",
+            module_names=module_names,
+            container_image=self.settings.container_image,
+            preferred_modes=preferred_modes or None,
+            force_mode=force_mode
+        )
+        
+        return self.samtools_info
         
     def _setup_handlers(self):
         @self.server.list_tools()
@@ -197,10 +242,16 @@ class SamtoolsServer:
             if not input_file.exists():
                 return [ErrorContent(text=f"Input file not found: {input_file}")]
             
+            # Detect samtools tool
+            tool_info = await self._detect_samtools()
+            if tool_info.mode == ExecutionMode.UNAVAILABLE:
+                return [ErrorContent(text="samtools is not available in any execution mode")]
+            
             with tempfile.TemporaryDirectory(dir=self.settings.temp_dir) as tmpdir:
                 output_file = Path(tmpdir) / f"output.{arguments.get('output_format', 'bam')}"
                 
-                cmd = [self.settings.samtools_path, "view"]
+                # Build samtools command arguments
+                tool_args = ["view"]
                 
                 # Output format
                 format_flag = {
@@ -208,31 +259,49 @@ class SamtoolsServer:
                     "bam": "-b",
                     "cram": "-C"
                 }
-                cmd.append(format_flag.get(arguments.get("output_format", "bam"), "-b"))
+                tool_args.append(format_flag.get(arguments.get("output_format", "bam"), "-b"))
                 
                 # Filters
                 if arguments.get("flags_include"):
-                    cmd.extend(["-f", str(arguments["flags_include"])])
+                    tool_args.extend(["-f", str(arguments["flags_include"])])
                 if arguments.get("flags_exclude"):
-                    cmd.extend(["-F", str(arguments["flags_exclude"])])
+                    tool_args.extend(["-F", str(arguments["flags_exclude"])])
                 if arguments.get("quality_min"):
-                    cmd.extend(["-q", str(arguments["quality_min"])])
+                    tool_args.extend(["-q", str(arguments["quality_min"])])
                 
                 # Output file
-                cmd.extend(["-o", str(output_file)])
+                tool_args.extend(["-o", str(output_file)])
                 
                 # Input file
-                cmd.append(str(input_file))
+                tool_args.append(str(input_file))
                 
                 # Region
                 if arguments.get("region"):
-                    cmd.append(arguments["region"])
+                    tool_args.append(arguments["region"])
                 
-                process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
+                # Get the complete command based on execution mode
+                cmd = self.detector.get_execution_command(tool_info, tool_args)
+                
+                logger.info(f"Executing samtools view via {tool_info.mode.value}: {' '.join(cmd)}")
+                
+                # Execute command
+                if tool_info.mode in [ExecutionMode.MODULE, ExecutionMode.LMOD]:
+                    # Module commands need to be executed in shell
+                    shell_cmd = " ".join(cmd)
+                    process = await asyncio.create_subprocess_shell(
+                        shell_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=tmpdir
+                    )
+                else:
+                    # Direct execution for native, container modes
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=tmpdir
+                    )
                 
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
